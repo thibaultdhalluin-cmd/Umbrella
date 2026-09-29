@@ -13,13 +13,11 @@ Principe :
     normalisés pour chaque singularité)
   * les contraintes (débit, ΔP max, vitesse max, dénivelé max point haut
     vs départ, pression en A) se règlent dans la barre latérale
-  * IHM « industrielle » sombre façon pupitre SCADA : bandeau de voyants
-    (ΔP max, vitesse, NPSH) toujours sous la synthèse, cartes KPI à accent
-    rouge, thème sombre injecté en CSS ; le contenu reste en arborescence —
-    synthèse (métriques + statut) toujours visible, puis un onglet par
-    étape (schéma P&ID, bilan détaillé, étude paramétrique, dimensionnement
-    DN, export PDF) ; méthode de calcul et réglages avancés repliés dans
-    la barre latérale
+  * interface simple « fiche de projet », thème clair : synthèse (4
+    indicateurs clés sur deux lignes + statut) toujours visible, puis un
+    onglet par étape (schéma P&ID, bilan détaillé, étude paramétrique,
+    dimensionnement DN, export PDF) ; méthode de calcul et réglages
+    avancés repliés dans la barre latérale
 
 Modèle physique :
   * pertes régulières : Darcy–Weisbach  ΔP = f · (L/D) · ρv²/2
@@ -61,52 +59,6 @@ import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Pertes de charge", page_icon="🚰",
                    layout="wide")
-
-st.markdown(
-    """
-    <style>
-    /* ---- IHM industrielle sombre (pupitre SCADA) ------------------ */
-    .stApp { background: #0b0e14; color: #e6ecf5; }
-    .stApp h1, .stApp h2, .stApp h3 { color: #e6ecf5; }
-    .stApp p, .stApp li, .stApp span, .stApp td, .stApp th {
-        color: #e6ecf5; }
-    .stApp .stCaption, p[data-testid="stCaption"] { color: #8b98a9; }
-    section[data-testid="stSidebar"] {
-        background: #10141d; border-right: 1px solid #1d2431; }
-    section[data-testid="stSidebar"] * { color: #e6ecf5; }
-    /* cartes KPI : fond sombre, liseré rouge à gauche */
-    div[data-testid="stMetric"] {
-        background: #141a24; border: 1px solid #1d2431;
-        border-left: 3px solid #ff4c4c; border-radius: 8px;
-        padding: 10px 14px; }
-    div[data-testid="stMetric"] label {
-        color: #8b98a9 !important; text-transform: uppercase;
-        font-size: 11px !important; letter-spacing: 0.06em; }
-    div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
-        font-family: "Consolas", "Courier New", monospace; }
-    /* onglets */
-    button[data-baseweb="tab"] {
-        background: #141a24; color: #8b98a9;
-        border: 1px solid #1d2431; border-radius: 8px 8px 0 0; }
-    button[data-baseweb="tab"]:hover { color: #e6ecf5; }
-    button[data-baseweb="tab"][aria-selected="true"] {
-        background: #1a2230; color: #ff6b6b; }
-    /* boutons de téléchargement : rouge plein */
-    div[data-testid="stDownloadButton"] > button {
-        background: #ff4c4c; color: #0b0e14; font-weight: bold;
-        border: none; border-radius: 6px; }
-    div[data-testid="stDownloadButton"] > button:hover {
-        background: #ff6b6b; color: #0b0e14; }
-    /* sections repliées */
-    details[data-testid="stExpander"] {
-        background: #141a24; border: 1px solid #1d2431;
-        border-radius: 8px; }
-    /* bannières statut */
-    div[data-testid="stAlert"] { border-radius: 8px; }
-    </style>
-    """,
-    unsafe_allow_html=True)
-
 st.title("🚰 Pertes de charge — construction du réseau")
 st.caption("Ajoutez les éléments ligne par ligne (l'ordre des lignes = "
            "l'ordre du réseau, de A vers B) : le schéma et les pertes de "
@@ -211,6 +163,12 @@ RUGOSITES_TYPIQUES = ("PVC ≈ 0,0015 · inox ≈ 0,015 · acier neuf ≈ 0,05 �
 def ffr(v: float, dec: int = 0) -> str:
     """Format numérique français : 12 345,6."""
     return f"{v:,.{dec}f}".replace(",", " ").replace(".", ",")
+
+
+def ffr_rond(v: float, dec: int = 1) -> str:
+    """ffr arrondi, sans zéro traînant (« chiffre rond ») : 401,0 -> 401."""
+    s = ffr(v, dec)
+    return s.rstrip("0").rstrip(",") if "," in s else s
 
 
 def _num(x, default):
@@ -419,18 +377,18 @@ def diagramme_svg(res: list, dP_tot_mbar: float):
     H = 40 + line_h * len(lines) + 8
     p = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}"'
          f' font-family="Arial, Helvetica, sans-serif">',
-         f'<rect width="{W}" height="{H}" fill="#10141c"/>']
+         f'<rect width="{W}" height="{H}" fill="white"/>']
 
     def fleche(x1: float, x2: float, y: float):
         p.append(f'<line x1="{x1}" y1="{y}" x2="{x2}" y2="{y}"'
-                 f' stroke="#dfe7f1" stroke-width="2.5"/>')
+                 f' stroke="#0e1117" stroke-width="2.5"/>')
         p.append(f'<polygon points="{x2},{y} {x2 - 8},{y - 4}'
-                 f' {x2 - 8},{y + 4}" fill="#dfe7f1"/>')
+                 f' {x2 - 8},{y + 4}" fill="#0e1117"/>')
 
     def icone(typ: str, x: float, w: float, yc: float):
         """Symbole ISA-5.1 de la singularité, posé sur la canalisation."""
         cx = x + w / 2
-        ST = "#dfe7f1"                          # trait P&ID (noir)
+        ST = "#0e1117"                          # trait P&ID (noir)
         stl = (f'stroke="{ST}" stroke-width="2" fill="none" '
                'stroke-linecap="round" stroke-linejoin="round"')
         flu = f'fill="{ST}"'
@@ -537,9 +495,9 @@ def diagramme_svg(res: list, dP_tot_mbar: float):
         yc = 40 + li * line_h + 52
         if li == 0:                                   # point A (départ)
             cx = x0 - 34
-            p.append(f'<circle cx="{cx}" cy="{yc}" r="9" fill="#dfe7f1"/>')
+            p.append(f'<circle cx="{cx}" cy="{yc}" r="9" fill="#0e1117"/>')
             p.append(f'<text x="{cx}" y="{yc - 18}" text-anchor="middle"'
-                     f' font-size="12" font-weight="bold" fill="#dfe7f1">A</text>')
+                     f' font-size="12" font-weight="bold" fill="#0e1117">A</text>')
             fleche(cx + 10, x0 - 2, yc)
         x_fin = None
         for e, x, w in ligne:
@@ -547,85 +505,37 @@ def diagramme_svg(res: list, dP_tot_mbar: float):
                 fleche(x_fin + 2, x - 2, yc)
             if e["tuyau"]:              # canalisation : trait simple (P&ID)
                 p.append(f'<line x1="{x}" y1="{yc}" x2="{x + w}" y2="{yc}"'
-                         f' stroke="#dfe7f1" stroke-width="3.5"/>')
+                         f' stroke="#0e1117" stroke-width="3.5"/>')
                 p.append(f'<text x="{x + w / 2}" y="{yc - 8}"'
                          f' text-anchor="middle" font-size="9"'
-                         f' fill="#9fb0c3">L = {ffr(e["L"], 1)} m</text>')
+                         f' fill="#39424e">L = {ffr_rond(e["L"], 1)} m</text>')
             else:
                 icone(e["typ"], x, w, yc)
             p.append(f'<text x="{x + w / 2}" y="{yc - 24}"'
                      f' text-anchor="middle" font-size="10"'
-                     f' font-weight="bold" fill="#dfe7f1">{e["nom"]}</text>')
+                     f' font-weight="bold" fill="#0e1117">{e["nom"]}</text>')
             p.append(f'<text x="{x + w / 2}" y="{yc + 32}"'
-                     f' text-anchor="middle" font-size="10" fill="#ff7b72">'
-                     f'ΔP = {ffr(e["dp"] / 100.0, 1)} mbar</text>')
+                     f' text-anchor="middle" font-size="10" fill="#c0392b">'
+                     f'ΔP = {ffr_rond(e["dp"] / 100.0, 1)} mbar</text>')
             x_fin = x + w
         if li < len(lines) - 1:                       # suite à la ligne suivante
             fleche(x_fin + 2, x_fin + 22, yc)
             p.append(f'<text x="{x_fin + 26}" y="{yc + 4}" font-size="10"'
-                     f' fill="#8b98a9">suite ↓</text>')
+                     f' fill="#7a8490">suite ↓</text>')
 
     # point B (arrivée) + perte de charge totale
     yc_b = 40 + (len(lines) - 1) * line_h + 52
     fin = lines[-1][-1][1] + lines[-1][-1][2]
     fleche(fin + 2, fin + 26, yc_b)
     cxb = min(fin + 40, W - 14)
-    p.append(f'<circle cx="{cxb}" cy="{yc_b}" r="9" fill="#dfe7f1"/>')
+    p.append(f'<circle cx="{cxb}" cy="{yc_b}" r="9" fill="#0e1117"/>')
     p.append(f'<text x="{cxb}" y="{yc_b - 18}" text-anchor="middle"'
-             f' font-size="12" font-weight="bold" fill="#dfe7f1">B</text>')
+             f' font-size="12" font-weight="bold" fill="#0e1117">B</text>')
     p.append(f'<text x="{cxb}" y="{yc_b + 30}" text-anchor="middle"'
-             f' font-size="10" font-weight="bold" fill="#ff7b72">'
-             f'Σ ΔP = {ffr(dP_tot_mbar, 1)} mbar</text>')
+             f' font-size="10" font-weight="bold" fill="#c0392b">'
+             f'Σ ΔP = {ffr_rond(dP_tot_mbar, 1)} mbar</text>')
     p.append("</svg>")
     return "".join(p), H
-
-
-# ------------------------------------------------------------------ #
-# 3c. Bandeau de voyants « pupitre industriel » (HTML minimal)       #
-# ------------------------------------------------------------------ #
-
-def voyants_html(dP_fournir, dP_max, v_tuyau_max, v_max, NPSHd, NPSHr):
-    """Voyants ΔP / vitesse / NPSH + verdict global, façon pupitre SCADA."""
-    dP_ok = dP_fournir <= dP_max * 100.0
-    v_ok = v_tuyau_max <= v_max
-    npsh_ok = NPSHd >= NPSHr
-
-    def lampe(titre, valeur, limite, conforme):
-        c = "#21c354" if conforme else "#ff4c4c"
-        return (
-            '<div style="display:flex;align-items:center;gap:10px;'
-            'background:#141a24;border:1px solid #1d2431;'
-            'border-radius:10px;padding:8px 14px;">'
-            f'<div style="width:14px;height:14px;min-width:14px;'
-            f'border-radius:50%;background:{c};'
-            f'box-shadow:0 0 10px {c};"></div>'
-            '<div style="line-height:1.3;">'
-            f'<div style="color:#8b98a9;font-size:10px;'
-            f'letter-spacing:0.08em;font-weight:bold;">{titre}</div>'
-            f'<div style="color:#e6ecf5;font-size:14px;'
-            f'font-weight:bold;">{valeur}</div>'
-            f'<div style="color:#8b98a9;font-size:10px;">{limite}</div>'
-            '</div></div>')
-
-    l1 = lampe("ΔP MAX", f"{ffr(dP_fournir / 100.0, 1)} mbar",
-               f"limite {ffr(dP_max, 1)} mbar", dP_ok)
-    l2 = lampe("VITESSE", f"{ffr(v_tuyau_max, 2)} m/s",
-               f"limite {ffr(v_max, 1)} m/s", v_ok)
-    l3 = lampe("NPSH", f"{ffr(NPSHd, 2)} m",
-               f"requis ≥ {ffr(NPSHr, 1)} m", npsh_ok)
-    conforme = dP_ok and v_ok and npsh_ok
-    cv = "#21c354" if conforme else "#ff4c4c"
-    verdict = "RÉSEAU CONFORME" if conforme else "RÉSEAU NON CONFORME"
-    return (
-        '<div style="background:#0b0e14;padding:2px;">'
-        '<div style="display:flex;gap:10px;align-items:stretch;'
-        'font-family:Consolas,\'Courier New\',monospace;">'
-        + l1 + l2 + l3 +
-        f'<div style="display:flex;align-items:center;padding:0 18px;'
-        f'background:#141a24;border:1px solid {cv};border-radius:10px;'
-        f'color:{cv};font-size:13px;font-weight:bold;'
-        f'letter-spacing:0.05em;box-shadow:0 0 12px {cv}33;">{verdict}'
-        '</div></div></div>')
 
 
 # ------------------------------------------------------------------ #
@@ -889,38 +799,29 @@ puissance = Q_m3s * dP_fournir                     # W
 
 # --- synthèse toujours visible ------------------------------------ #
 st.subheader("📊 Synthèse")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Σ pertes de charge", f"{ffr(dP_tot / 100.0, 1)} mbar")
+k1, k2 = st.columns(2)
+k1.metric("Σ pertes de charge", f"{ffr_rond(dP_tot / 100.0, 1)} mbar")
 k2.metric("ΔP à fournir (avec dénivelé max)",
-          f"{ffr(dP_fournir / 100.0, 1)} mbar")
-k3.metric("HMT (point haut vs départ)", f"{ffr(HMT, 2)} m")
-k4.metric("NPSH disponible (en A)", f"{ffr(NPSHd, 2)} m")
-k5, k6, k7, k8 = st.columns(4)
-k5.metric("Vitesse max", f"{ffr(v_max_reseau, 2)} m/s")
-k6.metric("Pression en A", f"{ffr(P_A, 2)} bar")
-k7.metric("Pression en B", f"{ffr(P_B, 2)} bar")
-k8.metric("Puissance hydraulique", f"{ffr(puissance, 0)} W")
+          f"{ffr_rond(dP_fournir / 100.0, 1)} mbar")
+k3, k4 = st.columns(2)
+k3.metric("HMT (point haut vs départ)", f"{ffr_rond(HMT, 1)} m")
+k4.metric("NPSH disponible (en A)", f"{ffr_rond(NPSHd, 1)} m")
 
 if not res:
     st.info("Ajoutez des éléments au réseau dans le tableau ci-dessus : "
             "le schéma et les pertes de charge se calculent en direct.")
 else:
-    # --- bandeau de voyants (pupitre industriel) ------------------- #
-    v_tuyau_max = max((r["v"] for r in res if r["tuyau"]), default=0.0)
-    components.html(voyants_html(dP_fournir, dP_max, v_tuyau_max,
-                                 v_max, NPSHd, NPSHr), height=68)
-
     # --- statut compact (détail dans l'onglet « Bilan détaillé ») -- #
     probs = []
     if dP_fournir > dP_max * 100.0:
-        probs.append(f"ΔP à fournir {ffr(dP_fournir / 100.0, 1)} mbar > "
-                     f"{ffr(dP_max, 1)} mbar")
+        probs.append(f"ΔP à fournir {ffr_rond(dP_fournir / 100.0, 1)} mbar > "
+                     f"{ffr_rond(dP_max, 1)} mbar")
     if any(r["tuyau"] and r["v"] > v_max for r in res):
-        probs.append(f"vitesse max {ffr(v_max_reseau, 2)} m/s > "
-                     f"{ffr(v_max, 1)} m/s")
+        probs.append(f"vitesse max {ffr_rond(v_max_reseau, 2)} m/s > "
+                     f"{ffr_rond(v_max, 1)} m/s")
     if NPSHd < NPSHr:
-        probs.append(f"NPSH disponible {ffr(NPSHd, 2)} m < requis "
-                     f"{ffr(NPSHr, 1)} m")
+        probs.append(f"NPSH disponible {ffr_rond(NPSHd, 1)} m < requis "
+                     f"{ffr_rond(NPSHr, 1)} m")
     if probs:
         st.error("✖ Contrainte non respectée : " + " · ".join(probs)
                  + " — l'onglet « 🎯 Dimensionnement (DN) » propose des "
@@ -947,36 +848,36 @@ else:
         # --- respect des contraintes -------------------------------- #
         if dP_fournir <= dP_max * 100.0:
             st.success(f"✔ Contrainte de perte de charge respectée : "
-                       f"{ffr(dP_fournir / 100.0, 1)} mbar ≤ "
-                       f"{ffr(dP_max, 1)} mbar.")
+                       f"{ffr_rond(dP_fournir / 100.0, 1)} mbar ≤ "
+                       f"{ffr_rond(dP_max, 1)} mbar.")
         else:
             st.error(f"✖ Contrainte de perte de charge dépassée : "
-                     f"{ffr(dP_fournir / 100.0, 1)} mbar > "
-                     f"{ffr(dP_max, 1)} mbar (dépassement de "
-                     f"{ffr(dP_fournir / 100.0 - dP_max, 1)} mbar).")
+                     f"{ffr_rond(dP_fournir / 100.0, 1)} mbar > "
+                     f"{ffr_rond(dP_max, 1)} mbar (dépassement de "
+                     f"{ffr_rond(dP_fournir / 100.0 - dP_max, 1)} mbar).")
 
         trop_rapide = [r for r in res if r["tuyau"] and r["v"] > v_max]
         if trop_rapide:
             st.error("✖ Vitesse max dépassée : "
-                     + " · ".join(f"{r['nom']} ({ffr(r['v'], 2)} m/s)"
+                     + " · ".join(f"{r['nom']} ({ffr_rond(r['v'], 2)} m/s)"
                                   for r in trop_rapide)
                      + f" — augmentez le diamètre (limite : "
-                     f"{ffr(v_max, 1)} m/s).")
+                     f"{ffr_rond(v_max, 1)} m/s).")
         else:
-            st.success(f"✔ Vitesses ≤ {ffr(v_max, 1)} m/s partout.")
+            st.success(f"✔ Vitesses ≤ {ffr_rond(v_max, 1)} m/s partout.")
 
         # --- check NPSH : cavitation ? ------------------------------ #
         if NPSHd >= NPSHr + 0.5:
-            st.success(f"✔ NPSH disponible ({ffr(NPSHd, 2)} m) ≥ NPSH "
-                       f"requis ({ffr(NPSHr, 1)} m) + 0,5 m de marge : "
+            st.success(f"✔ NPSH disponible ({ffr_rond(NPSHd, 1)} m) ≥ NPSH "
+                       f"requis ({ffr_rond(NPSHr, 1)} m) + 0,5 m de marge : "
                        "pas de risque de cavitation.")
         elif NPSHd >= NPSHr:
-            st.warning(f"⚠ NPSH disponible ({ffr(NPSHd, 2)} m) ≥ NPSH "
-                       f"requis ({ffr(NPSHr, 1)} m) mais la marge est "
+            st.warning(f"⚠ NPSH disponible ({ffr_rond(NPSHd, 1)} m) ≥ NPSH "
+                       f"requis ({ffr_rond(NPSHr, 1)} m) mais la marge est "
                        "inférieure à 0,5 m.")
         else:
-            st.error(f"✖ NPSH disponible ({ffr(NPSHd, 2)} m) < NPSH "
-                     f"requis ({ffr(NPSHr, 1)} m) : risque de cavitation "
+            st.error(f"✖ NPSH disponible ({ffr_rond(NPSHd, 1)} m) < NPSH "
+                     f"requis ({ffr_rond(NPSHr, 1)} m) : risque de cavitation "
                      "— augmente la pression d'aspiration, refroidis le "
                      "fluide ou choisis une pompe à NPSH requis plus "
                      "faible.")
@@ -1058,8 +959,8 @@ else:
                                     index=qs)
             courbe_q.index.name = "Débit [m³/h]"
             st.line_chart(courbe_q, y="ΔP à fournir [mbar]")
-            st.caption(f"Point actuel : Q = {ffr(Q, 2)} m³/h → "
-                       f"{ffr(dP_fournir / 100.0, 1)} mbar "
+            st.caption(f"Point actuel : Q = {ffr_rond(Q, 2)} m³/h → "
+                       f"{ffr_rond(dP_fournir / 100.0, 1)} mbar "
                        "(en turbulent, ΔP ≈ ∝ Q²).")
 
         with c2:
@@ -1112,9 +1013,9 @@ else:
 
         if ok_dp and ok_v:
             st.success("✔ Le réseau respecte déjà les deux contraintes "
-                       f"(ΔP à fournir {ffr(dP_fournir / 100.0, 1)} mbar ≤ "
-                       f"{ffr(dP_max, 1)} mbar, vitesse ≤ "
-                       f"{ffr(v_max, 1)} m/s) — aucun sur-dimensionnement "
+                       f"(ΔP à fournir {ffr_rond(dP_fournir / 100.0, 1)} mbar ≤ "
+                       f"{ffr_rond(dP_max, 1)} mbar, vitesse ≤ "
+                       f"{ffr_rond(v_max, 1)} m/s) — aucun sur-dimensionnement "
                        "nécessaire.")
         else:
             # facteur de diamètre minimal respectant ΔP max ET vitesse max
@@ -1158,9 +1059,9 @@ else:
                            f"**×{ffr(f_min, 2)}** → DN normalisés "
                            "proposés ci-dessous. Vérification sur le "
                            "réseau re-dimensionné : ΔP à fournir = "
-                           f"{ffr(dP_dn, 1)} mbar (≤ {ffr(dP_max, 1)}) "
-                           f"et vitesse max = {ffr(v_dn, 2)} m/s "
-                           f"(≤ {ffr(v_max, 1)}).")
+                           f"{ffr_rond(dP_dn, 1)} mbar (≤ {ffr_rond(dP_max, 1)}) "
+                           f"et vitesse max = {ffr_rond(v_dn, 2)} m/s "
+                           f"(≤ {ffr_rond(v_max, 1)}).")
                 st.markdown("\n".join(changements))
                 st.caption("DN = diamètre nominal normalisé le plus proche "
                            "supérieur à Ø × facteur ; recopie ces valeurs "
@@ -1178,20 +1079,23 @@ else:
            f"rho = {ffr(rho, 1)} kg/m3 - mu = {ffr(mu, 5)} Pa.s - "
            f"Pvap = {ffr(pvap, 0)} Pa",
            "## Contraintes et pressions",
-           f"Debit : {ffr(Q, 2)} m3/h - ΔP max admissible : "
-           f"{ffr(dP_max, 1)} mbar - vitesse max : {ffr(v_max, 1)} m/s",
-           f"Dénivelé max (point haut vs départ) : {ffr(dz, 1)} m",
-           f"Pression atmosphérique : {ffr(P_atm, 3)} bar abs",
-           f"Pression connue : {p_connue} - A = {ffr(P_A, 2)} bar, "
-           f"B = {ffr(P_B, 2)} bar (relatives)",
+           f"Debit : {ffr_rond(Q, 2)} m3/h - ΔP max admissible : "
+           f"{ffr_rond(dP_max, 1)} mbar - vitesse max : "
+           f"{ffr_rond(v_max, 1)} m/s",
+           f"Dénivelé max (point haut vs départ) : {ffr_rond(dz, 1)} m",
+           f"Pression atmosphérique : {ffr_rond(P_atm, 3)} bar abs",
+           f"Pression connue : {p_connue} - A = {ffr_rond(P_A, 2)} bar, "
+           f"B = {ffr_rond(P_B, 2)} bar (relatives)",
            "## Résultats",
-           f"Somme des pertes de charge : {ffr(dP_tot / 100.0, 1)} mbar",
+           f"Somme des pertes de charge : "
+           f"{ffr_rond(dP_tot / 100.0, 1)} mbar",
            f"ΔP à fournir (avec dénivelé max) : "
-           f"{ffr(dP_fournir / 100.0, 1)} mbar",
-           f"HMT (point haut vs départ) : {ffr(HMT, 2)} m",
-           f"NPSH disponible en A : {ffr(NPSHd, 2)} m "
-           f"(NPSH requis : {ffr(NPSHr, 1)} m)",
-           f"Vitesse max dans les tuyaux : {ffr(v_max_reseau, 2)} m/s",
+           f"{ffr_rond(dP_fournir / 100.0, 1)} mbar",
+           f"HMT (point haut vs départ) : {ffr_rond(HMT, 1)} m",
+           f"NPSH disponible en A : {ffr_rond(NPSHd, 1)} m "
+           f"(NPSH requis : {ffr_rond(NPSHr, 1)} m)",
+           f"Vitesse max dans les tuyaux : "
+           f"{ffr_rond(v_max_reseau, 2)} m/s",
            f"Puissance hydraulique : {ffr(puissance, 0)} W",
            "## Éléments du réseau (ordre A -> B)",
            " #  Nom                       Type                     "
@@ -1210,8 +1114,9 @@ else:
             rap.append(f"Facteur de diamètre minimal : x"
                        f"{ffr(dn_proposition['f'], 2)}")
             rap.append(f"Vérification avec les DN proposés : ΔP à "
-                       f"fournir = {ffr(dn_proposition['dP'], 1)} mbar - "
-                       f"vitesse max = {ffr(dn_proposition['v'], 2)} m/s")
+                       f"fournir = {ffr_rond(dn_proposition['dP'], 1)} mbar - "
+                       f"vitesse max = "
+                       f"{ffr_rond(dn_proposition['v'], 2)} m/s")
             rap.extend(l.replace("- ", "", 1)
                        for l in dn_proposition["lignes"])
         else:
