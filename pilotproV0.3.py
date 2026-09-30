@@ -1,0 +1,1158 @@
+"""
+🚀 PilotPro — Le logiciel du chef de projet ultime (version Python / Streamlit)
+
+Nouveau projet · Modifier une tâche · Tableau de bord · Kanban · Tâches · Planning · Équipe · Budget COPIL · Rapports
+Thème clair moderne, suivi EVM présenté façon COPIL (verdicts simples, sans jargon,
+détails experts en option), courbes en S cumulées, cases à cocher par projet,
+création de projets avec tâches initiales. Aucune donnée pré-remplie :
+tout se saisit dans l'onglet « Nouveau projet ». Capacité équipe : 140 h/mois.
+
+Installation et lancement :
+    pip install streamlit pandas
+    streamlit run pilotpro.py
+
+Plotly est OPTIONNEL : s'il est absent (ex. Streamlit Cloud sans requirements.txt),
+l'application bascule automatiquement sur les graphiques natifs Streamlit/Altair.
+Pour les graphiques interactifs complets : ajoutez « plotly » dans requirements.txt.
+"""
+
+import json
+import uuid
+from datetime import date, timedelta
+
+import pandas as pd
+import streamlit as st
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+# ==================================================================
+# CONFIGURATION
+# ==================================================================
+
+st.set_page_config(page_title="PilotPro", page_icon="🚀", layout="wide")
+
+TODAY = date.today()
+
+
+def d(offset: int) -> date:
+    """Date relative à aujourd'hui (offset en jours)."""
+    return TODAY + timedelta(days=offset)
+
+
+def fmt_d(dt: date) -> str:
+    return dt.strftime("%d %b")
+
+
+def fmt_k(v: float) -> str:
+    return f"{round(v / 1000):,}".replace(",", " ") + " k€"
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+# ==================================================================
+# DONNÉES DE DÉMO
+# ==================================================================
+
+MEMBERS = [
+    {"id": "m1", "name": "Thibault D'Halluin", "role": "Product Owner", "initials": "TD", "color": "#818cf8", "capacity": 140},
+    {"id": "m2", "name": "Amélie Laurent", "role": "Cheffe de projet", "initials": "AL", "color": "#f472b6", "capacity": 140},
+    {"id": "m3", "name": "Karim Benali", "role": "Dev Lead", "initials": "KB", "color": "#34d399", "capacity": 140},
+    {"id": "m4", "name": "Sofia Moreau", "role": "UX Designer", "initials": "SM", "color": "#fbbf24", "capacity": 140},
+    {"id": "m5", "name": "Léa Dubois", "role": "QA / Tests", "initials": "LD", "color": "#22d3ee", "capacity": 140},
+    {"id": "m6", "name": "Marc Petit", "role": "Dev Full-stack", "initials": "MP", "color": "#f87171", "capacity": 140},
+]
+
+MONTHLY_MAX_H = 140  # capacité mensuelle maximale par personne (heures)
+
+DEMO_PROJECTS = []  # rien de pré-rempli : créez vos projets dans l'onglet « Nouveau projet »
+
+STATUSES = [
+    {"id": "backlog", "label": "Backlog", "color": "#94a3b8"},
+    {"id": "todo", "label": "À faire", "color": "#38bdf8"},
+    {"id": "doing", "label": "En cours", "color": "#a78bfa"},
+    {"id": "review", "label": "En revue", "color": "#fbbf24"},
+    {"id": "done", "label": "Terminé", "color": "#34d399"},
+]
+
+PRIORITIES = [
+    {"id": "critique", "label": "Critique", "color": "#f87171"},
+    {"id": "haute", "label": "Haute", "color": "#fb923c"},
+    {"id": "moyenne", "label": "Moyenne", "color": "#fbbf24"},
+    {"id": "basse", "label": "Basse", "color": "#94a3b8"},
+]
+
+HEALTH = {
+    "ok": ("🟢 Sain", "#10b981"),
+    "warn": ("🟠 Vigilance", "#f59e0b"),
+    "bad": ("🔴 Critique", "#ef4444"),
+}
+
+DEMO_TASKS = []  # rien de pré-rempli : les tâches se créent avec vos projets
+
+STATUS_IDS = [s["id"] for s in STATUSES]
+PRIO_IDS = [p["id"] for p in PRIORITIES]
+
+
+def get_member(mid):
+    return next(m for m in MEMBERS if m["id"] == mid)
+
+
+def get_project(pid):
+    return next(p for p in PROJECTS if p["id"] == pid)
+
+
+def status_of(t):
+    return next(s for s in STATUSES if s["id"] == t["status"])
+
+
+def prio_of(t):
+    return next(p for p in PRIORITIES if p["id"] == t["priority"])
+
+
+def is_late(t):
+    return t["status"] != "done" and t["due"] < TODAY
+
+
+# ==================================================================
+# EVM — EARNED VALUE MANAGEMENT
+# ==================================================================
+
+def span_days(t):
+    return max(1, (t["due"] - t["start"]).days)
+
+
+def planned_frac(t, day):
+    """Fraction de la tâche qui devait être livrée à `day` selon le planning."""
+    return clamp01((day - t["start"]).days / span_days(t))
+
+
+def earned_now(t):
+    """Fraction réellement acquise à ce jour."""
+    return 1.0 if t["status"] == "done" else t["progress"] / 100
+
+
+def earned_frac_at(t, day):
+    """Fraction acquise à `day` (reconstituée linéairement jusqu'à ce jour)."""
+    if day > TODAY:
+        return 0.0
+    if t["status"] == "done":
+        return clamp01((day - t["start"]).days / span_days(t))
+    elapsed = max(1, (TODAY - t["start"]).days)
+    return t["progress"] / 100 * clamp01((day - t["start"]).days / elapsed)
+
+
+def evm_metrics(pid, tasks):
+    p = get_project(pid)
+    ts = [t for t in tasks if t["projectId"] == pid]
+    total_est = sum(t["estimate"] for t in ts) or 1
+    cost_of = lambda t: p["bac"] * t["estimate"] / total_est
+    pv = sum(cost_of(t) * planned_frac(t, TODAY) for t in ts)
+    ev = sum(cost_of(t) * earned_now(t) for t in ts)
+    ac = ev * p["costFactor"]
+    cpi = ev / ac if ac > 0 else 1.0
+    spi = ev / pv if pv > 0 else 1.0
+    eac = p["bac"] / cpi if cpi > 0 else p["bac"]
+    cv, sv = ev - ac, ev - pv
+    vac = p["bac"] - eac
+    tcpi = (p["bac"] - ev) / (p["bac"] - ac) if (p["bac"] - ac) != 0 else 1.0
+    health = "ok" if (cpi >= 0.95 and spi >= 0.95) else ("warn" if (cpi >= 0.8 and spi >= 0.8) else "bad")
+    return {"p": p, "pv": pv, "ev": ev, "ac": ac, "cpi": cpi, "spi": spi,
+            "eac": eac, "etc": eac - ac, "vac": vac, "cv": cv, "sv": sv,
+            "tcpi": tcpi, "health": health, "pct": ev / p["bac"] if p["bac"] else 0}
+
+
+def evm_aggregate(pids, tasks):
+    """Cumul EVM d'une sélection de projets (CPI / SPI pondérés)."""
+    if not pids:
+        return None
+    ms = [evm_metrics(pid, tasks) for pid in pids]
+    bac = sum(m["p"]["bac"] for m in ms)
+    pv = sum(m["pv"] for m in ms)
+    ev = sum(m["ev"] for m in ms)
+    ac = sum(m["ac"] for m in ms)
+    cpi = ev / ac if ac > 0 else 1.0
+    spi = ev / pv if pv > 0 else 1.0
+    eac = bac / cpi if cpi > 0 else bac
+    cv, sv = ev - ac, ev - pv
+    vac = bac - eac
+    tcpi = (bac - ev) / (bac - ac) if (bac - ac) != 0 else 1.0
+    health = "ok" if (cpi >= 0.95 and spi >= 0.95) else ("warn" if (cpi >= 0.8 and spi >= 0.8) else "bad")
+    return {"bac": bac, "pv": pv, "ev": ev, "ac": ac, "cpi": cpi, "spi": spi,
+            "eac": eac, "etc": eac - ac, "vac": vac, "cv": cv, "sv": sv,
+            "tcpi": tcpi, "health": health, "pct": ev / bac if bac else 0, "count": len(pids)}
+
+
+def _curve_points(parts, bac, ev_today, ac_today, eac_total, start_d, end_d):
+    """Points communs des courbes en S (une liste par projet fournie)."""
+    total = max(7, (end_d - start_d).days)
+    step = max(1, round(total / 18))
+    offsets = set(range(0, total + 1, step))
+    today_off = (TODAY - start_d).days
+    if 0 <= today_off <= total:
+        offsets.add(today_off)
+    offsets.add(total)
+    end_from_today = max(1, (end_d - TODAY).days)
+    pts = []
+    for off in sorted(offsets):
+        day = start_d + timedelta(days=off)
+        is_future = day > TODAY
+        is_today = day == TODAY
+        pv = ev_a = ac_a = 0.0
+        for cost_of, ts, factor in parts:
+            for t in ts:
+                pv += cost_of(t) * planned_frac(t, day)
+                f = cost_of(t) * earned_frac_at(t, day)
+                ev_a += f
+                ac_a += f * factor
+        f_frac = clamp01((day - TODAY).days / end_from_today)
+        pts.append({
+            "date": day,
+            "pv": round(pv / 100) / 10,
+            "ev": None if is_future else round(ev_a / 100) / 10,
+            "ac": None if is_future else round(ac_a / 100) / 10,
+            "evF": round((ev_today + (bac - ev_today) * f_frac) / 100) / 10 if (is_future or is_today) else None,
+            "acF": round((ac_today + (eac_total - ac_today) * f_frac) / 100) / 10 if (is_future or is_today) else None,
+        })
+    return pts
+
+
+def _cost_factory(bac: float, total_est: float):
+    """Fabrique la fonction coût d'une tâche (évite le piège des closures en boucle)."""
+    return lambda t: bac * t["estimate"] / total_est
+
+
+def s_curve(pid, tasks):
+    m = evm_metrics(pid, tasks)
+    p = m["p"]
+    ts = [t for t in tasks if t["projectId"] == pid]
+    total_est = sum(t["estimate"] for t in ts) or 1
+    parts = [(_cost_factory(p["bac"], total_est), ts, p["costFactor"])]
+    start_d = min((t["start"] for t in ts), default=TODAY)
+    return _curve_points(parts, p["bac"], m["ev"], m["ac"], m["eac"], start_d, p["deadline"])
+
+
+def s_curve_multi(pids, tasks):
+    parts, starts, ends, evs, acs, eacs = [], [], [], [], [], []
+    bacs = 0.0
+    for pid in pids:
+        m = evm_metrics(pid, tasks)
+        p = m["p"]
+        ts = [t for t in tasks if t["projectId"] == pid]
+        total_est = sum(t["estimate"] for t in ts) or 1
+        parts.append((_cost_factory(p["bac"], total_est), ts, p["costFactor"]))
+        starts.append(min((t["start"] for t in ts), default=TODAY))
+        ends.append(p["deadline"])
+        evs.append(m["ev"])
+        acs.append(m["ac"])
+        eacs.append(m["eac"])
+        bacs += p["bac"]
+    if not parts:
+        return []
+    return _curve_points(parts, bacs, sum(evs), sum(acs), sum(eacs), min(starts), max(ends))
+
+
+def perf_color(v):
+    return "#10b981" if v >= 0.95 else ("#f59e0b" if v >= 0.85 else "#ef4444")
+
+
+def delta_color(v):
+    return "#10b981" if v >= 0 else "#ef4444"
+
+
+def evm_verdict(health):
+    """Verdict COPIL en une phrase, sans jargon."""
+    return {
+        "ok": ("🟢 Sur les rails", "#10b981", "rien à signaler"),
+        "warn": ("🟠 Vigilance", "#f59e0b", "à surveiller de près"),
+        "bad": ("🔴 Alerte", "#ef4444", "action corrective requise"),
+    }[health]
+
+
+def cost_words(cpi):
+    """CPI traduit en français simple."""
+    if abs(cpi - 1) < 0.005:
+        return "1 € de travail accompli en coûte 1,00 € (budget respecté)"
+    if cpi > 1:
+        return f"1 € de travail accompli en coûte {cpi:.2f} € (sous le budget)"
+    return f"1 € de travail accompli en coûte {cpi:.2f} € (dépassement)"
+
+
+def delay_words(spi):
+    """SPI traduit en français simple."""
+    if abs(spi - 1) < 0.005:
+        return "dans les temps du planning"
+    if spi > 1:
+        return f"en avance de {(spi - 1) * 100:.0f} % sur le planning"
+    return f"en retard de {(1 - spi) * 100:.0f} % sur le planning"
+
+
+def plot_s_curve(pts, height=340, show_legend=True):
+    xs = [p["date"] for p in pts]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=[p["pv"] for p in pts], name="Planifié",
+                             line=dict(color="#94a3b8", width=2), connectgaps=False))
+    fig.add_trace(go.Scatter(x=xs, y=[p["ev"] for p in pts], name="Valeur produite",
+                             line=dict(color="#10b981", width=2.5), connectgaps=False))
+    fig.add_trace(go.Scatter(x=xs, y=[p["ac"] for p in pts], name="Coût réel",
+                             line=dict(color="#ef4444", width=2.5), connectgaps=False))
+    fig.add_trace(go.Scatter(x=xs, y=[p["evF"] for p in pts], name="Projection valeur",
+                             line=dict(color="#10b981", width=1.5, dash="dash"), connectgaps=False))
+    fig.add_trace(go.Scatter(x=xs, y=[p["acF"] for p in pts], name="Projection coût (EAC)",
+                             line=dict(color="#ef4444", width=1.5, dash="dash"), connectgaps=False))
+    fig.add_vline(x=pd.Timestamp(TODAY), line=dict(color="#6366f1", dash="dot"),
+                  annotation_text="Aujourd'hui", annotation_font=dict(color="#4f46e5", size=10))
+    fig.update_layout(height=height, template="plotly_white", margin=dict(l=10, r=10, t=20, b=10),
+                      yaxis_title="k€", showlegend=show_legend,
+                      legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
+def show_s_curve(pts, height=340, show_legend=True):
+    """Affiche la courbe en S : Plotly si disponible, sinon graphiques natifs Streamlit."""
+    if PLOTLY_AVAILABLE:
+        st.plotly_chart(plot_s_curve(pts, height=height, show_legend=show_legend), use_container_width=True)
+        return
+    df = pd.DataFrame({
+        "Planifié (PV)": [p["pv"] for p in pts],
+        "Acquis (EV)": [p["ev"] for p in pts],
+        "Réel (AC)": [p["ac"] for p in pts],
+        "EV prévisionnel": [p["evF"] for p in pts],
+        "AC prévisionnel (EAC)": [p["acF"] for p in pts],
+    }, index=pd.to_datetime([p["date"] for p in pts]))
+    st.caption(f"📍 Aujourd'hui ({fmt_d(TODAY)}) : EV = "
+               f"{next((p['ev'] for p in pts if p['ev'] is not None), 0):.1f} k€")
+    st.line_chart(df, height=height)
+
+
+# ==================================================================
+# ÉTAT DE SESSION
+# ==================================================================
+
+if "projects" not in st.session_state:
+    st.session_state.projects = [dict(p) for p in DEMO_PROJECTS]
+if "tasks" not in st.session_state:
+    st.session_state.tasks = [dict(t) for t in DEMO_TASKS]
+
+PROJECTS = st.session_state.projects
+tasks = st.session_state.tasks
+
+
+# ==================================================================
+# COMPOSANTS D'INTERFACE
+# ==================================================================
+
+def md_metric(label, value_html):
+    st.markdown(
+        f"<div style='border:1px solid #e2e8f0;border-radius:10px;padding:8px 12px;background:#f8fafc'>"
+        f"<div style='font-size:.65rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em'>{label}</div>"
+        f"<div style='font-size:1.25rem;font-weight:800'>{value_html}</div></div>",
+        unsafe_allow_html=True)
+
+
+def kpi_row(items):
+    cols = st.columns(len(items))
+    for col, (label, value, sub) in zip(cols, items):
+        col.metric(label=label, value=value)
+        col.caption(sub)
+
+
+def task_editor(t, key_prefix, in_expander=True):
+    """Éditeur complet d'une tâche (statut, priorité, assigné, dates, avancement)."""
+    new_status = st.selectbox("Statut", STATUS_IDS, index=STATUS_IDS.index(t["status"]), key=f"{key_prefix}_st_{t['id']}")
+    if new_status != t["status"]:
+        t["status"] = new_status
+        if new_status == "done":
+            t["progress"] = 100
+        st.rerun()
+    new_prio = st.selectbox("Priorité", PRIO_IDS, index=PRIO_IDS.index(t["priority"]), key=f"{key_prefix}_pr_{t['id']}")
+    if new_prio != t["priority"]:
+        t["priority"] = new_prio
+        st.rerun()
+    member_names = [m["name"] for m in MEMBERS]
+    new_assignee = st.selectbox("Assigné à", member_names, index=[m["id"] for m in MEMBERS].index(t["assigneeId"]), key=f"{key_prefix}_as_{t['id']}")
+    new_id = next(m["id"] for m in MEMBERS if m["name"] == new_assignee)
+    if new_id != t["assigneeId"]:
+        t["assigneeId"] = new_id
+        st.rerun()
+    c1, c2 = st.columns(2)
+    new_start = c1.date_input("Début", value=t["start"], key=f"{key_prefix}_sd_{t['id']}", format="DD/MM/YYYY")
+    new_due = c2.date_input("Échéance", value=t["due"], key=f"{key_prefix}_du_{t['id']}", format="DD/MM/YYYY")
+    if new_start != t["start"]:
+        t["start"] = new_start
+        st.rerun()
+    if new_due != t["due"]:
+        t["due"] = new_due
+        st.rerun()
+    c3, c4 = st.columns(2)
+    new_est = c3.number_input("Estimation (h)", min_value=1, value=t["estimate"], key=f"{key_prefix}_es_{t['id']}")
+    if new_est != t["estimate"]:
+        t["estimate"] = int(new_est)
+        st.rerun()
+    new_prog = c4.slider("Avancement (%)", 0, 100, t["progress"], 5, key=f"{key_prefix}_pg_{t['id']}")
+    if new_prog != t["progress"]:
+        t["progress"] = int(new_prog)
+        st.rerun()
+    if st.button("🗑 Supprimer la tâche", key=f"{key_prefix}_del_{t['id']}"):
+        st.session_state.tasks = [x for x in tasks if x["id"] != t["id"]]
+        st.rerun()
+
+
+def new_task_form():
+    if not PROJECTS:
+        st.info("Créez d'abord un projet dans l'onglet « Nouveau projet » pour pouvoir ajouter des tâches.")
+        return
+    with st.expander("➕ Nouvelle tâche"):
+        with st.form("new_task_form", border=True):
+            title = st.text_input("Titre de la tâche")
+            c1, c2 = st.columns(2)
+            project_name = c1.selectbox("Projet", [p["name"] for p in PROJECTS])
+            assignee_name = c2.selectbox("Assigné à", [m["name"] for m in MEMBERS])
+            c3, c4 = st.columns(2)
+            priority = c3.selectbox("Priorité", PRIO_IDS, index=2)
+            status = c4.selectbox("Statut", STATUS_IDS, index=1)
+            c5, c6 = st.columns(2)
+            start = c5.date_input("Début", value=TODAY, format="DD/MM/YYYY")
+            due = c6.date_input("Échéance", value=d(7), format="DD/MM/YYYY")
+            c7, c8 = st.columns(2)
+            estimate = c7.number_input("Estimation (heures)", min_value=1, value=4)
+            submitted = st.form_submit_button("Créer la tâche", use_container_width=True, type="primary")
+        if submitted and title.strip():
+            st.session_state.tasks.insert(0, {
+                "id": "t" + uuid.uuid4().hex[:6],
+                "title": title.strip(),
+                "projectId": next(p["id"] for p in PROJECTS if p["name"] == project_name),
+                "assigneeId": next(m["id"] for m in MEMBERS if m["name"] == assignee_name),
+                "status": status, "priority": priority,
+                "start": start, "due": due, "estimate": int(estimate), "progress": 0,
+            })
+            st.rerun()
+
+
+# ==================================================================
+# VUES
+# ==================================================================
+
+def view_dashboard():
+    st.subheader("🏠 Vue d'ensemble du portefeuille")
+    if not tasks:
+        st.info("👋 Bienvenue dans PilotPro ! Rien n'est pré-rempli : rendez-vous dans l'onglet "
+                "« Nouveau projet » pour créer votre premier projet et ses tâches.")
+        return
+    total = len(tasks)
+    done = [t for t in tasks if t["status"] == "done"]
+    late = [t for t in tasks if is_late(t)]
+    total_est = sum(t["estimate"] for t in tasks) or 1
+    weighted = sum(t["estimate"] * (100 if t["status"] == "done" else t["progress"]) / 100 for t in tasks) / total_est
+    open_est = sum(t["estimate"] * (1 - (100 if t["status"] == "done" else t["progress"]) / 100) for t in tasks if t["status"] != "done")
+    capacity = sum(m["capacity"] for m in MEMBERS)
+    load = open_est / capacity * 100
+    soon = [p for p in PROJECTS if p["deadline"] < d(14)]
+
+    kpi_row([
+        ("Avancement global", f"{weighted:.0f}%", f"{len(done)}/{total} tâches terminées"),
+        ("En retard", str(len(late)), "échéances dépassées"),
+        ("Charge équipe", f"{load:.0f}%", f"{open_est:.0f}h restantes / {capacity}h de capacité"),
+        ("Projets actifs", str(len(PROJECTS)), f"{len(soon)} échéance(s) < 14 j" if soon else "échéances sereines"),
+    ])
+    st.divider()
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("**📈 Burndown — 14 derniers jours**")
+        days = [d(-i) for i in range(13, -1, -1)]
+        ideal = [round(total * i / 13) for i in range(13, -1, -1)]
+        remaining = [total - len([t for t in done if t["due"] <= day]) for day in days]
+        if PLOTLY_AVAILABLE:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=days, y=ideal, name="Idéal",
+                                     line=dict(color="#94a3b8", width=1.5, dash="dash")))
+            fig.add_trace(go.Scatter(x=days, y=remaining, name="Restant",
+                                     line=dict(color="#6366f1", width=2.5), fill="tozeroy",
+                                     fillcolor="rgba(99,102,241,0.12)"))
+            fig.update_layout(height=250, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10),
+                              legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.line_chart(pd.DataFrame({"Idéal": ideal, "Restant": remaining},
+                                       index=pd.to_datetime(days)), height=250)
+    with right:
+        st.markdown("**🥧 Répartition par statut**")
+        counts = [(s["label"], len([t for t in tasks if t["status"] == s["id"]]), s["color"]) for s in STATUSES]
+        if PLOTLY_AVAILABLE:
+            fig = px.pie(names=[c[0] for c in counts], values=[c[1] for c in counts],
+                         color=[c[0] for c in counts], color_discrete_map={c[0]: c[2] for c in counts},
+                         hole=0.55)
+            fig.update_traces(textinfo="value", showlegend=True)
+            fig.update_layout(height=250, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(pd.Series({c[0]: c[1] for c in counts}, name="Tâches"),
+                         height=250, horizontal=True)
+
+    left2, right2 = st.columns([3, 2])
+    with left2:
+        st.markdown("**📈 Avancement par projet**")
+        for p in PROJECTS:
+            ts = [t for t in tasks if t["projectId"] == p["id"]]
+            est = sum(t["estimate"] for t in ts) or 1
+            pct = round(sum(t["estimate"] * (100 if t["status"] == "done" else t["progress"]) / 100 for t in ts) / est)
+            c1, c2 = st.columns([3, 1])
+            c1.markdown(f"**{p['name']}** <span style='color:#94a3b8'>· {p['client']}</span>", unsafe_allow_html=True)
+            c2.markdown(f"**{pct}%**", unsafe_allow_html=True)
+            c2.markdown(f"<div style='height:8px;border-radius:4px;background:#e2e8f0'>"
+                        f"<div style='height:8px;border-radius:4px;width:{pct}%;background:{p['color']}'></div></div>",
+                        unsafe_allow_html=True)
+    with right2:
+        st.markdown("**⏰ Prochaines échéances**")
+        upcoming = sorted([t for t in tasks if t["status"] != "done"], key=lambda t: t["due"])[:6]
+        for t in upcoming:
+            m = get_member(t["assigneeId"])
+            flag = "⚠️ " if is_late(t) else ""
+            color = "#ef4444" if is_late(t) else "#94a3b8"
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:8px;padding:4px 0'>"
+                f"<span style='width:26px;height:26px;border-radius:50%;background:{m['color']};"
+                f"color:#0f172a;font-size:11px;font-weight:800;display:inline-flex;align-items:center;justify-content:center'>{m['initials']}</span>"
+                f"<span style='flex:1;font-size:.85rem'>{flag}{t['title']}</span>"
+                f"<span style='font-size:.75rem;color:{color};font-weight:700'>{'⚠ ' if is_late(t) else ''}{fmt_d(t['due'])}</span></div>",
+                unsafe_allow_html=True)
+
+
+def view_kanban():
+    new_task_form()
+    st.divider()
+    cols = st.columns(5)
+    for col, s in zip(cols, STATUSES):
+        items = [t for t in tasks if t["status"] == s["id"]]
+        with col:
+            st.markdown(f"<span style='color:{s['color']}'>●</span> **{s['label']}** "
+                        f"<span style='color:#94a3b8'>({len(items)})</span>", unsafe_allow_html=True)
+            for t in items:
+                p, prio = get_project(t["projectId"]), prio_of(t)
+                with st.container(border=True):
+                    st.markdown(f"**{t['title']}**")
+                    st.markdown(
+                        f"<span style='color:{p['color']};font-size:.68rem;font-weight:800'>{p['name'].upper()}</span> · "
+                        f"<span style='color:{prio['color']};font-size:.68rem;font-weight:800'>{prio['label'].upper()}</span>",
+                        unsafe_allow_html=True)
+                    if t["status"] != "done" and t["progress"] > 0:
+                        st.progress(t["progress"])
+                    late_html = f"<span style='color:#ef4444;font-weight:800'>⚠ {fmt_d(t['due'])}</span>" if is_late(t) \
+                        else f"<span style='color:#94a3b8'>{fmt_d(t['due'])}</span>"
+                    st.markdown(late_html, unsafe_allow_html=True)
+                    with st.expander("Éditer"):
+                        task_editor(t, "kb")
+
+
+def view_tasks():
+    new_task_form()
+    st.divider()
+    c1, c2, c3, c4, c5 = st.columns([2.4, 1.3, 1.3, 1.3, 1])
+    q = c1.text_input("🔍 Rechercher", "")
+    f_status = c2.selectbox("Statut", ["all"] + STATUS_IDS, format_func=lambda x: "Tous" if x == "all" else x)
+    f_prio = c3.selectbox("Priorité", ["all"] + PRIO_IDS, format_func=lambda x: "Toutes" if x == "all" else x)
+    f_member = c4.selectbox("Assigné", ["all"] + [m["id"] for m in MEMBERS],
+                            format_func=lambda x: "Toute l'équipe" if x == "all" else get_member(x)["name"])
+    f_late = c5.checkbox("Retards uniquement")
+
+    rows = []
+    for t in tasks:
+        if q and q.lower() not in t["title"].lower():
+            continue
+        if f_status != "all" and t["status"] != f_status:
+            continue
+        if f_prio != "all" and t["priority"] != f_prio:
+            continue
+        if f_member != "all" and t["assigneeId"] != f_member:
+            continue
+        if f_late and not is_late(t):
+            continue
+        p, m, s, prio = get_project(t["projectId"]), get_member(t["assigneeId"]), status_of(t), prio_of(t)
+        rows.append({
+            "Tâche": t["title"], "Projet": p["name"], "Assigné": m["name"],
+            "Priorité": prio["label"], "Statut": s["label"],
+            "Échéance": ("⚠ " if is_late(t) else "") + t["due"].strftime("%d/%m/%Y"),
+            "Avancement": f"{100 if t['status'] == 'done' else t['progress']}%",
+            "Estimation (h)": t["estimate"],
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=420)
+    st.caption(f"{len(rows)} tâche(s) affichée(s)")
+
+    st.divider()
+    st.markdown("**✏️ Modifier une tâche**")
+    options = {f"{t['title']}  ·  {get_project(t['projectId'])['name']}": t for t in tasks}
+    if options:
+        choice = st.selectbox("Tâche", list(options.keys()))
+        task_editor(options[choice], "ed")
+
+
+def view_planning():
+    st.subheader("📅 Planning prévisionnel (Gantt)")
+    st.caption("Une ligne par tâche, regroupées par projet · portion assombrie = avancement réel · "
+               "bandes grises = week-ends · glissez le curseur sous le graphique pour zoomer.")
+
+    f1, f2, f3 = st.columns(3)
+    f_project = f1.selectbox("Projet", ["all"] + [p["id"] for p in PROJECTS],
+                             format_func=lambda x: "Tous les projets" if x == "all" else get_project(x)["name"],
+                             key="pl_project")
+    f_assignee = f2.selectbox("Assigné", ["all"] + [m["id"] for m in MEMBERS],
+                              format_func=lambda x: "Toute l'équipe" if x == "all" else get_member(x)["name"],
+                              key="pl_member")
+    hide_done = f3.checkbox("Masquer les tâches terminées", key="pl_hide_done")
+
+    shown = [t for t in tasks
+             if (f_project == "all" or t["projectId"] == f_project)
+             and (f_assignee == "all" or t["assigneeId"] == f_assignee)
+             and not (hide_done and t["status"] == "done")]
+    if not shown:
+        st.info("Aucune tâche pour ces filtres.")
+        return
+
+    order = sorted(shown, key=lambda t: (get_project(t["projectId"])["name"], t["start"], t["title"]))
+    df = pd.DataFrame([{
+        "title": t["title"], "start": pd.Timestamp(t["start"]), "end": pd.Timestamp(t["due"]),
+        "project": get_project(t["projectId"])["name"], "assignee": get_member(t["assigneeId"])["name"],
+        "estimate": t["estimate"], "Avancement": f"{100 if t['status'] == 'done' else t['progress']} %",
+    } for t in order])
+    colors = {p["name"]: p["color"] for p in PROJECTS}
+
+    if PLOTLY_AVAILABLE:
+        fig = px.timeline(df, x_start="start", x_end="end", y="title", color="project",
+                          color_discrete_map=colors, category_orders={"title": list(df["title"])},
+                          hover_data=["assignee", "estimate", "Avancement"])
+        # portion assombrie = avancement réel
+        prog_rows = []
+        for t in order:
+            pct = 100 if t["status"] == "done" else t["progress"]
+            span = max(1, (t["due"] - t["start"]).days)
+            if pct > 0:
+                prog_rows.append({"title": t["title"], "start": pd.Timestamp(t["start"]),
+                                  "end": pd.Timestamp(t["start"] + timedelta(days=span * pct / 100)),
+                                  "project": get_project(t["projectId"])["name"]})
+        if prog_rows:
+            figp = px.timeline(pd.DataFrame(prog_rows), x_start="start", x_end="end",
+                               y="title", color="project", color_discrete_map=colors,
+                               category_orders={"title": list(df["title"])})
+            for tr in figp.data:
+                tr.showlegend = False
+                tr.marker.color = "#0f172a"
+                tr.marker.opacity = 0.25
+                fig.add_trace(tr)
+        # week-ends grisés
+        lo = min(t["start"] for t in shown)
+        hi = max(t["due"] for t in shown)
+        d0 = lo
+        while d0 <= hi:
+            if d0.weekday() == 5:
+                fig.add_vrect(x0=pd.Timestamp(d0), x1=pd.Timestamp(d0 + timedelta(days=2)),
+                              fillcolor="#e2e8f0", opacity=0.55, line_width=0, layer="below")
+            d0 += timedelta(days=1)
+        fig.update_yaxes(autorange="reversed", showgrid=True, gridcolor="#f1f5f9",
+                         tickfont=dict(size=11))
+        fig.update_xaxes(showgrid=True, gridcolor="#f1f5f9", tickformat="%d %b",
+                         rangeslider=dict(visible=True, thickness=0.05, bgcolor="#fafafa"),
+                         rangeselector=dict(buttons=[
+                             dict(count=7, label="7 j", step="day", stepmode="backward"),
+                             dict(count=14, label="2 sem.", step="day", stepmode="backward"),
+                             dict(count=1, label="1 mois", step="month", stepmode="backward"),
+                             dict(step="all", label="Tout")]))
+        fig.add_vline(x=pd.Timestamp(TODAY), line=dict(color="#6366f1", width=1.5, dash="dot"),
+                      annotation_text="Aujourd'hui", annotation_font=dict(color="#4f46e5", size=10))
+        fig.update_layout(height=max(320, 34 * len(order) + 130), template="plotly_white",
+                          bargap=0.32, margin=dict(l=10, r=10, t=20, b=10),
+                          legend=dict(orientation="h", yanchor="bottom", y=1.01, x=1, xanchor="right"))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        import altair as alt
+        base = alt.Chart(df).mark_bar().encode(
+            y=alt.Y("title", sort=list(df["title"]), axis=alt.Axis(title=None)),
+            x=alt.X("start", title="Date"),
+            x2="end",
+            color=alt.Color("project", scale=alt.Scale(domain=list(colors), range=list(colors.values())),
+                            legend=None),
+            tooltip=["title", "project", "assignee", "estimate", "Avancement"],
+        )
+        today = alt.Chart(pd.DataFrame({"x": [pd.Timestamp(TODAY)]})).mark_rule(
+            color="#6366f1", strokeDash=[4, 4]).encode(x="x")
+        st.altair_chart((base + today).properties(height=max(320, 34 * len(order) + 100)),
+                        use_container_width=True)
+        st.caption("ℹ️ Installez Plotly (via requirements.txt) pour la version Gantt avancée : "
+                   "avancement dans les barres, week-ends, zoom et sélecteur de période.")
+
+    late = [t for t in shown if is_late(t)]
+    st.caption(f"{len(shown)} tâche(s) affichée(s) · période du "
+               f"{min(t['start'] for t in shown).strftime('%d %b')} au "
+               f"{max(t['due'] for t in shown).strftime('%d %b')} · "
+               f"{'⚠️ ' + str(len(late)) + ' en retard' if late else 'aucun retard'}")
+
+
+def view_team():
+    st.subheader("👥 Charge de l'équipe")
+    st.caption(f"Capacité mensuelle de référence : {MONTHLY_MAX_H} h par personne · "
+               "taux de charge = heures restantes / capacité mensuelle.")
+
+    rows = []
+    for m in MEMBERS:
+        open_tasks = [t for t in tasks if t["assigneeId"] == m["id"] and t["status"] != "done"]
+        remaining = round(sum(t["estimate"] * (1 - t["progress"] / 100) for t in open_tasks))
+        rate = round(remaining / MONTHLY_MAX_H * 100)
+        rows.append({"m": m, "remaining": remaining, "rate": rate, "open": len(open_tasks),
+                     "late": len([t for t in open_tasks if is_late(t)])})
+
+    total = sum(r["remaining"] for r in rows)
+    avg = round(sum(r["rate"] for r in rows) / len(rows))
+    over = [r for r in rows if r["rate"] > 100]
+    kpi_row([
+        ("Heures restantes", f"{total} h", f"capacité mensuelle totale : {MONTHLY_MAX_H * len(MEMBERS)} h"),
+        ("Taux de charge moyen", f"{avg} %", "100 % = capacité mensuelle atteinte"),
+        ("En surcharge", str(len(over)), "taux de charge > 100 %" if over else "personne au-delà de 100 %"),
+    ])
+
+    st.divider()
+    for r in rows:
+        m, rate, remaining = r["m"], r["rate"], r["remaining"]
+        color = "#ef4444" if rate > 100 else ("#f59e0b" if rate > 80 else "#10b981")
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([2.4, 2.2, 1.4])
+            c1.markdown(
+                f"<span style='width:34px;height:34px;border-radius:50%;background:{m['color']};"
+                f"color:#0f172a;font-size:13px;font-weight:800;display:inline-flex;align-items:center;"
+                f"justify-content:center'>{m['initials']}</span> &nbsp;**{m['name']}**<br>"
+                f"<span style='font-size:.72rem;color:#94a3b8'>{m['role']} · {r['open']} tâche(s) ouverte(s)"
+                + (f" · <b style='color:#ef4444'>{r['late']} en retard</b>" if r["late"] else "")
+                + "</span>", unsafe_allow_html=True)
+            c2.markdown(
+                f"<div style='height:12px;border-radius:6px;background:#e2e8f0;overflow:hidden'>"
+                f"<div style='height:12px;border-radius:6px;width:{min(100, rate)}%;background:{color}'></div></div>",
+                unsafe_allow_html=True)
+            c3.markdown(
+                f"<b style='color:{color};font-size:1.05rem'>{rate} %</b> "
+                f"<span style='font-size:.75rem;color:#94a3b8'>· {remaining} h</span>"
+                + (f"<br><span style='font-size:.68rem;color:#ef4444;font-weight:700'>"
+                   f"⚠ surcharge de {remaining - MONTHLY_MAX_H} h</span>" if rate > 100 else ""),
+                unsafe_allow_html=True)
+
+
+def view_evm():
+    st.subheader("💶 Budget — vu COPIL")
+    st.caption("Une seule question : les projets cochés tiennent-ils leur budget et leur planning ?")
+    if not PROJECTS:
+        st.info("Aucun projet pour l'instant — créez-en un dans l'onglet « Nouveau projet ».")
+        return
+
+    selected = []
+    cb = st.columns(len(PROJECTS))
+    for col, p in zip(cb, PROJECTS):
+        with col:
+            if st.checkbox(p["name"], value=True, key=f"chk_{p['id']}"):
+                selected.append(p["id"])
+            h = evm_metrics(p["id"], tasks)["health"]
+            st.markdown(f"<span style='font-size:.75rem;font-weight:700;color:{evm_verdict(h)[1]}'>"
+                        f"{evm_verdict(h)[0]}</span>", unsafe_allow_html=True)
+    if not selected:
+        st.info("Cochez au moins un projet ci-dessus pour afficher le suivi.")
+        return
+
+    m = evm_aggregate(selected, tasks)
+    vl, vc, va = evm_verdict(m["health"])
+
+    st.markdown(
+        f"<div style='border:2px solid {vc};border-radius:12px;padding:12px 18px;background:#f8fafc;margin-bottom:10px'>"
+        f"<span style='font-size:1.1rem;font-weight:800;color:{vc}'>{vl}</span> "
+        f"<span style='font-size:.85rem;color:#64748b'>— {va} · {m['count']} projet(s) suivi(s)</span><br>"
+        f"<span style='font-size:.9rem;color:#334155'>Avancement réel <b>{m['pct'] * 100:.0f} %</b> · "
+        f"budget dépensé <b>{m['ac'] / m['bac'] * 100:.0f} %</b> · "
+        f"coût final estimé <b>{fmt_k(m['eac'])}</b> pour un budget de <b>{fmt_k(m['bac'])}</b> "
+        f"(<b style='color:{delta_color(m['vac'])}'>{fmt_k(m['vac'])}</b>)</span></div>",
+        unsafe_allow_html=True)
+
+    kpi_row([
+        ("Avancement réel", f"{m['pct'] * 100:.0f} %", f"valeur produite : {fmt_k(m['ev'])}"),
+        ("Budget consommé", f"{m['ac'] / m['bac'] * 100:.0f} %", f"dépensé à ce jour : {fmt_k(m['ac'])}"),
+        ("Coût final estimé", fmt_k(m["eac"]), f"budget : {fmt_k(m['bac'])} · écart prévu : {fmt_k(m['vac'])}"),
+        ("Délai", delay_words(m["spi"]).capitalize(), cost_words(m["cpi"])),
+    ])
+
+    st.divider()
+    st.markdown("**👁 Coup d'œil par projet coché**")
+    for pid in selected:
+        e = evm_metrics(pid, tasks)
+        p = e["p"]
+        cvl, cvc, _ = evm_verdict(e["health"])
+        with st.container(border=True):
+            r1, r2, r3 = st.columns([2, 2.6, 1.2])
+            r1.markdown(f"<span style='color:{p['color']}'>●</span> **{p['name']}**<br>"
+                        f"<span style='font-size:.72rem;color:#94a3b8'>{p['client']} · échéance {fmt_d(p['deadline'])}</span>",
+                        unsafe_allow_html=True)
+            r2.markdown(f"<span style='font-size:.8rem;color:#475569'>Avancement <b>{e['pct'] * 100:.0f} %</b> · "
+                        f"dépensé <b>{fmt_k(e['ac'])}</b> · coût final estimé <b>{fmt_k(e['eac'])}</b> "
+                        f"(budget {fmt_k(e['p']['bac'])}) · <b>{delay_words(e['spi'])}</b></span>",
+                        unsafe_allow_html=True)
+            r3.markdown(f"<span style='font-weight:800;color:{cvc}'>{cvl}</span>", unsafe_allow_html=True)
+
+    st.divider()
+    mode = st.radio("Mode d'affichage", ["Cumul", "Par projet"], horizontal=True, label_visibility="collapsed")
+    if mode == "Cumul":
+        st.markdown("**📈 Trajectoire budgétaire cumulée** "
+                    "<span style='color:#94a3b8;font-size:.8rem'>(lignes pleines = constaté, pointillées = projection "
+                    "jusqu'au coût final estimé ; la verticale marque aujourd'hui)</span>", unsafe_allow_html=True)
+        show_s_curve(s_curve_multi(selected, tasks))
+    else:
+        for pid in selected:
+            p = get_project(pid)
+            e = evm_metrics(pid, tasks)
+            cvl, cvc, _ = evm_verdict(e["health"])
+            st.markdown(f"**● {p['name']}** <span style='font-size:.82rem;color:{cvc}'>{cvl}</span> "
+                        f"<span style='font-size:.82rem;color:#64748b'>· {cost_words(e['cpi'])} · {delay_words(e['spi'])}</span>",
+                        unsafe_allow_html=True)
+            show_s_curve(s_curve(pid, tasks), height=240, show_legend=False)
+
+    with st.expander("🔬 Détails EVM pour les experts"):
+        rows = []
+        for pid in selected:
+            e = evm_metrics(pid, tasks)
+            rows.append({
+                "Projet": get_project(pid)["name"], "BAC": fmt_k(e["p"]["bac"]), "PV": fmt_k(e["pv"]),
+                "EV": fmt_k(e["ev"]), "AC": fmt_k(e["ac"]), "CV": fmt_k(e["cv"]), "SV": fmt_k(e["sv"]),
+                "CPI": f"{e['cpi']:.2f}", "SPI": f"{e['spi']:.2f}", "EAC": fmt_k(e["eac"]),
+                "ETC": fmt_k(e["etc"]), "VAC": fmt_k(e["vac"]), "TCPI": f"{e['tcpi']:.2f}",
+                "Santé": HEALTH[e["health"]][0],
+            })
+        rows.append({
+            "Projet": f"Σ Cumul sélection ({m['count']})", "BAC": fmt_k(m["bac"]), "PV": fmt_k(m["pv"]),
+            "EV": fmt_k(m["ev"]), "AC": fmt_k(m["ac"]), "CV": fmt_k(m["cv"]), "SV": fmt_k(m["sv"]),
+            "CPI": f"{m['cpi']:.2f}", "SPI": f"{m['spi']:.2f}", "EAC": fmt_k(m["eac"]),
+            "ETC": fmt_k(m["etc"]), "VAC": fmt_k(m["vac"]), "TCPI": f"{m['tcpi']:.2f}",
+            "Santé": HEALTH[m["health"]][0],
+        })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("PV = valeur planifiée · EV = valeur acquise · AC = coût réel · CPI = EV / AC · SPI = EV / PV · "
+                   "EAC = BAC / CPI · VAC = BAC − EAC. Coûts réels modélisés à partir de l'avancement des tâches × "
+                   "facteur de coût du projet (données de démo).")
+
+
+def view_reports():
+    st.subheader("📊 Rapports")
+    st.caption("Cochez les projets à inclure — la sélection est partagée avec l'onglet Budget COPIL.")
+    if not PROJECTS:
+        st.info("Aucun projet pour l'instant — créez-en un dans l'onglet « Nouveau projet ».")
+        return
+
+    selected = []
+    cb = st.columns(len(PROJECTS))
+    for col, p in zip(cb, PROJECTS):
+        with col:
+            if st.checkbox(p["name"], value=True, key=f"chk_{p['id']}"):
+                selected.append(p["id"])
+    if not selected:
+        st.info("Cochez au moins un projet ci-dessus pour générer le rapport.")
+        return
+
+    ftasks = [t for t in tasks if t["projectId"] in selected]
+    fprojects = [p for p in PROJECTS if p["id"] in selected]
+    m = evm_aggregate(selected, tasks)
+    vl, vc, _ = evm_verdict(m["health"])
+    late_n = len([t for t in ftasks if is_late(t)])
+    remaining_h = sum(t["estimate"] * (1 - (100 if t["status"] == "done" else t["progress"]) / 100)
+                      for t in ftasks)
+
+    kpi_row([
+        ("Tâches incluses", str(len(ftasks)),
+         f"{len([t for t in ftasks if t['status'] == 'done'])} terminée(s)"),
+        ("Heures restantes", f"{remaining_h:.0f} h", f"{len(fprojects)} projet(s) coché(s)"),
+        ("En retard", str(late_n), "échéances dépassées"),
+        ("Verdict budget", vl, f"coût final estimé : {fmt_k(m['eac'])}"),
+    ])
+    st.divider()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**💪 Charge restante par membre (h)**")
+        data = []
+        for mem in MEMBERS:
+            remaining = round(sum(t["estimate"] * (1 - t["progress"] / 100)
+                                  for t in ftasks if t["assigneeId"] == mem["id"] and t["status"] != "done"))
+            data.append({"Membre": mem["initials"], "Capacité": mem["capacity"], "Restant": remaining, "color": mem["color"]})
+        df = pd.DataFrame(data)
+        if PLOTLY_AVAILABLE:
+            fig = go.Figure()
+            fig.add_bar(x=df["Membre"], y=df["Capacité"], name="Capacité", marker_color="#e2e8f0")
+            fig.add_bar(x=df["Membre"], y=df["Restant"], name="Restant", marker_color=df["color"])
+            fig.update_layout(barmode="overlay", height=260, template="plotly_white",
+                              margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(df.set_index("Membre")[["Capacité", "Restant"]], height=260)
+
+        st.markdown("**🚨 Priorités ouvertes**")
+        counts = [(p["label"], len([t for t in ftasks if t["priority"] == p["id"] and t["status"] != "done"]), p["color"]) for p in PRIORITIES]
+        if PLOTLY_AVAILABLE:
+            fig = px.pie(names=[c[0] for c in counts], values=[c[1] for c in counts],
+                         color=[c[0] for c in counts], color_discrete_map={c[0]: c[2] for c in counts}, hole=0.4)
+            fig.update_layout(height=260, template="plotly_white", margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(pd.Series({c[0]: c[1] for c in counts}, name="Tâches ouvertes"),
+                         height=260, horizontal=True)
+    with c2:
+        st.markdown("**🗂️ Heures par projet coché**")
+        data = []
+        for p in fprojects:
+            ts = [t for t in ftasks if t["projectId"] == p["id"]]
+            data.append({
+                "Projet": p["name"],
+                "Heures totales": sum(t["estimate"] for t in ts),
+                "Heures restantes": round(sum(t["estimate"] * (1 - (100 if t["status"] == "done" else t["progress"]) / 100) for t in ts)),
+            })
+        df = pd.DataFrame(data)
+        if PLOTLY_AVAILABLE:
+            fig = go.Figure()
+            fig.add_bar(y=df["Projet"], x=df["Heures totales"], name="Heures totales", orientation="h", marker_color="#94a3b8")
+            fig.add_bar(y=df["Projet"], x=df["Heures restantes"], name="Heures restantes", orientation="h", marker_color="#6366f1")
+            fig.update_layout(barmode="overlay", height=260, template="plotly_white",
+                              margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(df.set_index("Projet")[["Heures totales", "Heures restantes"]],
+                         height=260, horizontal=True)
+
+        st.markdown("**📌 Statistiques clés (projets cochés)**")
+        total_h = sum(t["estimate"] for t in ftasks)
+        done_n = len([t for t in ftasks if t["status"] == "done"])
+        grid = st.columns(2)
+        stats = [
+            ("Heures estimées (total)", f"{total_h}h"),
+            ("Heures restantes", f"{remaining_h:.0f}h"),
+            ("Tâches terminées", f"{done_n}/{len(ftasks)}"),
+            ("Taux de retard", f"{late_n / max(1, len(ftasks)) * 100:.0f}%"),
+            ("Charge moyenne / membre", f"{remaining_h / len(MEMBERS):.0f}h"),
+            ("Projets cochés", str(len(fprojects))),
+        ]
+        for col, (label, value) in zip(grid * 3, stats):
+            md_metric(label, value)
+
+
+# ==================================================================
+# CRÉATION DE PROJET
+# ==================================================================
+
+def view_create_project():
+    st.subheader("🚀 Nouveau projet")
+    st.caption("Définissez le projet, son budget (BAC) et son facteur de coût, puis ses premières tâches. "
+               "Le projet apparaît immédiatement dans toutes les vues (Kanban, Planning, EVM…).")
+
+    flash = st.session_state.pop("cp_flash", None)
+    if flash:
+        st.success(f"✅ Projet « {flash} » créé — il est visible dans toutes les vues.")
+
+    n_tasks = st.number_input("Nombre de tâches initiales à créer", 0, 10, 3, key="cp_n")
+
+    with st.form("create_project_form", border=True):
+        st.markdown("**📌 Informations du projet**")
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Nom du projet *", key="cp_name")
+        client = c2.text_input("Client", key="cp_client")
+        c3, c4, c5 = st.columns(3)
+        deadline = c3.date_input("Échéance", value=d(30), format="DD/MM/YYYY", key="cp_deadline")
+        bac = c4.number_input("Budget total — BAC (€)", min_value=1000, value=100000, step=1000, key="cp_bac")
+        color = c5.color_picker("Couleur", "#818cf8", key="cp_color")
+        cost_factor = st.slider("Facteur de coût (dérive budgétaire simulée)", 0.50, 1.50, 1.00, 0.01,
+                                key="cp_cost", help="> 1 : surcoût (AC = EV × facteur) ; < 1 : économie.")
+
+        st.markdown("**✅ Tâches initiales** (laissez le titre vide pour ignorer une tâche)")
+        member_names = [m["name"] for m in MEMBERS]
+        for i in range(int(n_tasks)):
+            with st.expander(f"Tâche {i + 1}", expanded=(i == 0)):
+                t_title = st.text_input("Titre", key=f"cp_t{i}_title")
+                a1, a2 = st.columns(2)
+                t_assignee = a1.selectbox("Assigné à", member_names, key=f"cp_t{i}_as")
+                t_prio = a2.selectbox("Priorité", PRIO_IDS, index=2, key=f"cp_t{i}_pr")
+                b1, b2 = st.columns(2)
+                t_start = b1.date_input("Début", value=TODAY, format="DD/MM/YYYY", key=f"cp_t{i}_sd")
+                t_due = b2.date_input("Échéance", value=d(7), format="DD/MM/YYYY", key=f"cp_t{i}_du")
+                c1, c2 = st.columns(2)
+                t_est = c1.number_input("Estimation (h)", min_value=1, value=8, key=f"cp_t{i}_es")
+                t_prog = c2.slider("Avancement (%)", 0, 100, 0, 5, key=f"cp_t{i}_pg")
+        submitted = st.form_submit_button("🚀 Créer le projet", use_container_width=True, type="primary")
+
+    if submitted:
+        if not str(name).strip():
+            st.error("Le nom du projet est obligatoire.")
+            return
+        if deadline <= TODAY:
+            st.error("L'échéance du projet doit être postérieure à aujourd'hui.")
+            return
+        pid = f"p{uuid.uuid4().hex[:6]}"
+        st.session_state.projects.append({
+            "id": pid, "name": str(name).strip(), "client": str(client).strip() or "Interne",
+            "color": color, "deadline": deadline, "bac": float(bac), "costFactor": cost_factor,
+        })
+        added = 0
+        for i in range(int(n_tasks)):
+            t_title = str(st.session_state.get(f"cp_t{i}_title", "")).strip()
+            if not t_title:
+                continue
+            assignee_name = st.session_state.get(f"cp_t{i}_as", member_names[0])
+            mid = next((m["id"] for m in MEMBERS if m["name"] == assignee_name), MEMBERS[0]["id"])
+            status = "done" if int(st.session_state.get(f"cp_t{i}_pg", 0)) >= 100 else "todo"
+            st.session_state.tasks.append({
+                "id": f"t{uuid.uuid4().hex[:6]}", "title": t_title, "projectId": pid,
+                "assigneeId": mid, "status": status,
+                "priority": st.session_state.get(f"cp_t{i}_pr", "moyenne"),
+                "start": st.session_state.get(f"cp_t{i}_sd", TODAY),
+                "due": st.session_state.get(f"cp_t{i}_du", d(7)),
+                "estimate": int(st.session_state.get(f"cp_t{i}_es", 8)),
+                "progress": int(st.session_state.get(f"cp_t{i}_pg", 0)),
+            })
+            added += 1
+        for k in list(st.session_state.keys()):
+            if k.startswith("cp_") and k != "cp_n":
+                del st.session_state[k]
+        st.session_state.cp_flash = str(name).strip()
+        st.rerun()
+
+    st.divider()
+    st.markdown("**🗂️ Projets existants**")
+    for p in PROJECTS:
+        ts = [t for t in tasks if t["projectId"] == p["id"]]
+        e = evm_metrics(p["id"], tasks)
+        with st.container(border=True):
+            k1, k2, k3 = st.columns([3, 1.6, 0.6])
+            k1.markdown(f"<span style='color:{p['color']}'>●</span> **{p['name']}** "
+                         f"<span style='color:#94a3b8'>· {p['client']}</span>", unsafe_allow_html=True)
+            k2.markdown(f"<span style='font-size:.78rem;color:#475569'>{len(ts)} tâche(s) · "
+                        f"BAC {fmt_k(e['p']['bac'])} · CPI "
+                        f"<b style='color:{perf_color(e['cpi'])}'>{e['cpi']:.2f}</b></span>",
+                        unsafe_allow_html=True)
+            if k3.button("🗑", key=f"del_p_{p['id']}", help="Supprimer le projet et toutes ses tâches"):
+                st.session_state.projects = [x for x in PROJECTS if x["id"] != p["id"]]
+                st.session_state.tasks = [t for t in tasks if t["projectId"] != p["id"]]
+                st.rerun()
+
+
+# ==================================================================
+# MODIFICATION D'UNE TÂCHE
+# ==================================================================
+
+def view_edit_task():
+    st.subheader("✏️ Modifier une tâche")
+    if not tasks:
+        st.info("Aucune tâche à modifier. Créez-en une depuis l'onglet « Nouveau projet ».")
+        return
+
+    flash = st.session_state.pop("et_flash", None)
+    if flash:
+        st.success(f"✅ Tâche « {flash} » mise à jour.")
+
+    options = {f"{t['title']} — {get_project(t['projectId'])['name']} ({status_of(t)['label']})": t
+               for t in tasks}
+    choice = st.selectbox("Tâche à modifier", list(options.keys()), key="et_choice")
+    t = options[choice]
+    st.caption(f"Début : {t['start'].strftime('%d/%m/%Y')} · Échéance : {t['due'].strftime('%d/%m/%Y')} · "
+               f"Estimation : {t['estimate']} h · Avancement actuel : "
+               f"{100 if t['status'] == 'done' else t['progress']} %")
+
+    keys = f"et_{t['id']}"
+    proj_names = [p["name"] for p in PROJECTS]
+    member_names = [m["name"] for m in MEMBERS]
+    with st.form("edit_task_form", border=True):
+        title = st.text_input("Titre *", value=t["title"], key=f"{keys}_title")
+        c1, c2 = st.columns(2)
+        proj_name = c1.selectbox("Projet", proj_names, index=proj_names.index(get_project(t["projectId"])["name"]),
+                                 key=f"{keys}_proj")
+        asg_name = c2.selectbox("Assigné à", member_names,
+                                index=[m["id"] for m in MEMBERS].index(t["assigneeId"]), key=f"{keys}_asg")
+        c3, c4 = st.columns(2)
+        prio = c3.selectbox("Priorité", PRIO_IDS, index=PRIO_IDS.index(t["priority"]), key=f"{keys}_pr")
+        stat = c4.selectbox("Statut", STATUS_IDS, index=STATUS_IDS.index(t["status"]), key=f"{keys}_st")
+        c5, c6 = st.columns(2)
+        start = c5.date_input("Début", value=t["start"], format="DD/MM/YYYY", key=f"{keys}_sd")
+        due = c6.date_input("Échéance", value=t["due"], format="DD/MM/YYYY", key=f"{keys}_du")
+        c7, c8 = st.columns(2)
+        est = c7.number_input("Estimation (h)", min_value=1, value=t["estimate"], key=f"{keys}_es")
+        prog = c8.slider("Avancement (%)", 0, 100, t["progress"], 5, key=f"{keys}_pg")
+        st.caption("Astuce : passer le statut à « Terminé » force l'avancement à 100 %.")
+        submitted = st.form_submit_button("💾 Mettre à jour la tâche", use_container_width=True, type="primary")
+
+    if submitted:
+        errors = []
+        if not str(title).strip():
+            errors.append("Le titre est obligatoire.")
+        if due < start:
+            errors.append("L'échéance doit être postérieure à la date de début.")
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            t["title"] = str(title).strip()
+            t["projectId"] = next(p["id"] for p in PROJECTS if p["name"] == proj_name)
+            t["assigneeId"] = next(m["id"] for m in MEMBERS if m["name"] == asg_name)
+            t["priority"] = prio
+            t["status"] = stat
+            t["start"] = start
+            t["due"] = due
+            t["estimate"] = int(est)
+            t["progress"] = 100 if stat == "done" else int(prog)
+            for k in [k for k in list(st.session_state.keys()) if k.startswith(f"et_{t['id']}_")]:
+                del st.session_state[k]
+            st.session_state.pop("et_choice", None)
+            st.session_state.et_flash = str(title).strip()
+            st.rerun()
+
+    st.divider()
+    if st.button("🗑 Supprimer cette tâche", key=f"del_t_{t['id']}"):
+        st.session_state.tasks = [x for x in tasks if x["id"] != t["id"]]
+        st.rerun()
+
+
+# ==================================================================
+# BARRE LATÉRALE & NAVIGATION
+# ==================================================================
+
+with st.sidebar:
+    st.markdown("## 🚀 PilotPro")
+    st.caption("Le logiciel du chef de projet ultime")
+    if not PLOTLY_AVAILABLE:
+        st.info("💡 Plotly n'est pas installé : l'app utilise les graphiques natifs. "
+                "Ajoutez `plotly` dans requirements.txt pour les graphiques interactifs.", icon="📈")
+    st.divider()
+    late_count = len([t for t in tasks if is_late(t)])
+    nav = st.radio(
+        "Navigation",
+        ["Nouveau projet", "Modifier une tâche", "Tableau de bord", "Kanban", "Tâches",
+         "Planning", "Équipe", "Budget COPIL", "Rapports"],
+        index=0, label_visibility="collapsed")
+    st.divider()
+    with st.expander("💾 Données"):
+        payload = json.dumps([{**t, "start": t["start"].isoformat(), "due": t["due"].isoformat()} for t in tasks],
+                             ensure_ascii=False, indent=2)
+        st.download_button("Exporter les tâches (JSON)", data=payload,
+                           file_name="pilotpro_tasks.json", mime="application/json", use_container_width=True)
+        if st.button("🔄 Tout effacer / repartir de zéro", use_container_width=True):
+            st.session_state.tasks = [dict(t) for t in DEMO_TASKS]
+            st.session_state.projects = [dict(p) for p in DEMO_PROJECTS]
+            st.rerun()
+    st.caption(f"⚠️ {late_count} tâche(s) en retard" if late_count else "✨ Aucun retard détecté")
+
+st.title(nav)
+st.caption(TODAY.strftime("%A %d %B %Y").capitalize())
+
+VIEWS = {
+    "Nouveau projet": view_create_project,
+    "Modifier une tâche": view_edit_task,
+    "Tableau de bord": view_dashboard,
+    "Kanban": view_kanban,
+    "Tâches": view_tasks,
+    "Planning": view_planning,
+    "Équipe": view_team,
+    "Budget COPIL": view_evm,
+    "Rapports": view_reports,
+}
+VIEWS[nav]()
